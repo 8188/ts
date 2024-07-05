@@ -1,6 +1,6 @@
 CC = g++
 CFLAGS = -pthread -std=c++17 -I..
-LIBS = -lredis++ -lhiredis -lpaho-mqttpp3
+LIBS = -lredis++ -lhiredis -lpaho-mqttpp3 -lmodbus
 
 MQTT_LIB = $(shell ./detect_mqtt.sh)
 

@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <ctime>
 #include <iostream>
+#include <memory>
 #include <random>
 #include <string>
 #include <thread>
@@ -13,6 +14,7 @@
 #include "dotenv.h"
 #include "nlohmann/json.hpp"
 #include "taskflow/taskflow.hpp"
+#include <modbus/modbus.h>
 #include <mqtt/async_client.h>
 #include <sw/redis++/redis++.h>
 
@@ -20,7 +22,7 @@ using json = nlohmann::json;
 
 constexpr const long long INTERVAL { 500000 };
 constexpr const int QOS { 1 };
-constexpr const auto TIMEOUT { std::chrono::seconds(10) };
+constexpr const auto TIMEOUT { std::chrono::seconds(5) };
 
 struct TempPoint {
     double last;
@@ -50,12 +52,27 @@ struct Parameters {
     const std::array<double, 2> sn; // SN曲线温度设定点
 };
 
-double generateRandomFloat(double min, double max)
+Parameters loadParameters(const json& j, const std::string& key)
 {
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_real_distribution<> dis(min, max);
-    return dis(gen);
+    return {
+        j[key]["density"].get<double>(),
+        j[key]["radius"].get<double>(),
+        j[key]["holeRadius"].get<double>(),
+        j[key]["deltaR"].get<double>(),
+        j[key]["scanCycle"].get<double>(),
+        j[key]["surfaceFactor"].get<double>(),
+        j[key]["centerFactor"].get<double>(),
+        j[key]["freeFactor"].get<double>(),
+        { j[key]["tcz"]["X"].get<std::vector<double>>(), j[key]["tcz"]["Y"].get<std::vector<double>>() },
+        { j[key]["shz"]["X"].get<std::vector<double>>(), j[key]["shz"]["Y"].get<std::vector<double>>() },
+        { j[key]["emz"]["X"].get<std::vector<double>>(), j[key]["emz"]["Y"].get<std::vector<double>>() },
+        { j[key]["prz"]["X"].get<std::vector<double>>(), j[key]["prz"]["Y"].get<std::vector<double>>() },
+        { j[key]["lecz"]["X"].get<std::vector<double>>(), j[key]["lecz"]["Y"].get<std::vector<double>>() },
+        { j[key]["SN1"]["X"].get<std::vector<double>>(), j[key]["SN1"]["Y"].get<std::vector<double>>() },
+        { j[key]["SN2"]["X"].get<std::vector<double>>(), j[key]["SN2"]["Y"].get<std::vector<double>>() },
+        { j[key]["SN3"]["X"].get<std::vector<double>>(), j[key]["SN3"]["Y"].get<std::vector<double>>() },
+        j[key]["sn"].get<std::array<double, 2>>()
+    };
 }
 
 bool fileExists(const std::string& filename)
@@ -83,8 +100,88 @@ std::string generate_random_string_with_hyphens()
     return ss.str();
 }
 
+class MyModbus {
+private:
+    const char* m_ip;
+    int m_port;
+    int m_slave_id;
+    std::unique_ptr<modbus_t, decltype(&modbus_free)> ctx;
+
+    void connect()
+    {
+        try {
+            ctx.reset(modbus_new_tcp(m_ip, m_port));
+            if (ctx == nullptr) {
+                throw std::runtime_error("Failed to allocate modbus context");
+            }
+
+            if (modbus_connect(ctx.get()) == -1) {
+                throw std::runtime_error(std::string("Modbus connection failed: ") + modbus_strerror(errno));
+            }
+
+            std::cout << "Connected to modbus." << std::endl;
+
+            modbus_set_slave(ctx.get(), m_slave_id);
+            modbus_set_response_timeout(ctx.get(), 0, 200000);
+        } catch (const std::exception& e) {
+            std::cerr << "Connection error: " << e.what() << std::endl;
+        }
+    }
+
+public:
+    MyModbus(const char* ip, int port, int slave_id)
+        : m_ip{ ip }
+        , m_port{ port }
+        , m_slave_id{ slave_id }
+        , ctx{ nullptr, &modbus_free }
+    {
+        connect();
+        int socket_fd = modbus_get_socket(ctx.get());
+        if (socket_fd == -1) {
+            throw std::runtime_error("Modbus connection is not established.");
+        }
+    }
+
+    ~MyModbus()
+    {
+        if (ctx) {
+            modbus_close(ctx.get());
+        }
+    }
+
+    std::vector<uint16_t> read_registers(int start_registers, int nb_registers)
+    {
+        if (nb_registers <= 0) {
+            return {};
+        }
+
+        std::vector<uint16_t> holding_registers(nb_registers);
+
+        int blocks = nb_registers / MODBUS_MAX_READ_REGISTERS + (nb_registers % MODBUS_MAX_READ_REGISTERS != 0);
+
+        try {
+            for (int i = 0; i < blocks; ++i) {
+                int addr = start_registers + i * MODBUS_MAX_READ_REGISTERS;
+                int nb = (i == blocks - 1) ? nb_registers % MODBUS_MAX_READ_REGISTERS : MODBUS_MAX_READ_REGISTERS;
+                int rc = modbus_read_registers(ctx.get(), addr, nb, &holding_registers[i * MODBUS_MAX_READ_REGISTERS]);
+                if (rc == -1) {
+                    throw std::runtime_error(std::string("Read Holding Registers failed: ") + modbus_strerror(errno));
+                }
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "Error: " << e.what() << std::endl;
+            holding_registers.clear();
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            connect(); // 断线重连
+        }
+        return holding_registers;
+    }
+};
+
 class MyRedis {
 private:
+    sw::redis::Redis m_redis;
+    
     sw::redis::ConnectionOptions makeConnectionOptions(const std::string& ip, int port, int db, const std::string& user, const std::string& password)
     {
         sw::redis::ConnectionOptions opts;
@@ -110,12 +207,39 @@ private:
     }
 
 public:
-    sw::redis::Redis redis;
-
     MyRedis(const std::string& ip, int port, int db, const std::string& user, const std::string& password)
-        : redis(makeConnectionOptions(ip, port, db, user, password), makePoolOptions())
+        : m_redis(makeConnectionOptions(ip, port, db, user, password), makePoolOptions())
     {
+        m_redis.ping();
         std::cout << "Connected to Redis.\n";
+    }
+
+    MyRedis(const std::string& unixSocket)
+        : m_redis(unixSocket)
+    {
+        m_redis.ping();
+        std::cout << "Connected to Redis by unix socket.\n";
+    }
+
+    double m_hget(const std::string& key, const std::string& field)
+    {
+        double res;
+        try {
+            const auto optional_str = m_redis.hget(key, field);
+            res = std::stod(optional_str.value_or("0"));
+        } catch (const std::exception& e) {
+            std::cerr << "Exception: " << e.what() << std::endl;
+        }
+        return res;
+    }
+
+    void m_hset(const std::string& hash, const std::string& key, const std::string& value)
+    {
+        try {
+            m_redis.hset(hash, key, value);
+        } catch (const std::exception& e) {
+            std::cerr << "Exception: " << e.what() << std::endl;
+        }
     }
 };
 
@@ -163,6 +287,10 @@ public:
         : client(address, clientId)
         , connOpts { buildConnectOptions(username, password, caCerts, certfile, keyFile, keyFilePassword) }
     {
+        connect();
+        if (!client.is_connected()) {
+            throw std::runtime_error("MQTT connection is not established.");
+        }
     }
 
     ~MyMQTT()
@@ -172,29 +300,40 @@ public:
 
     void connect()
     {
-        client.connect(connOpts)->wait();
-        std::cout << "Connected to MQTT broker.\n";
+        try {
+            client.connect(connOpts)->wait_for(TIMEOUT); // 断线重连
+            std::cout << "Connected to MQTT broker.\n";
+        } catch (const mqtt::exception& e) {
+            std::cerr << "Error: " << e.what() << std::endl;
+        }
     }
 
     void publish(const std::string& topic, const std::string& payload, int qos, bool retained = false)
     {
         auto msg = mqtt::make_message(topic, payload, qos, retained);
-        bool ok = client.publish(msg)->wait_for(TIMEOUT);
-        if (!ok) {
-            std::cerr << "Error: Publishing message timed out." << std::endl;
+        try {
+            bool ok = client.publish(msg)->wait_for(TIMEOUT);
+            if (!ok) {
+                std::cerr << "Error: Publishing message timed out." << std::endl;
+            }
+        } catch (const mqtt::exception& e) {
+            std::cerr << "Error: " << e.what() << std::endl;
+            connect();
         }
     }
 };
 
 class Rotor {
 public:
-    Rotor(const std::string& name, const std::string& unit, const Parameters& para,
-        std::shared_ptr<MyRedis> redis, std::shared_ptr<MyMQTT> MQTTCli)
+    Rotor(const std::string& name, const std::string& unit, const Parameters& para, const int controlWord,
+        std::shared_ptr<MyRedis> redis, std::shared_ptr<MyMQTT> MQTTCli, std::unique_ptr<MyModbus> modbusCli)
         : m_name { name }
         , m_unit { unit }
         , m_para { para }
+        , m_controlWord { controlWord }
         , m_redis { redis }
         , m_MQTTCli { MQTTCli }
+        , m_ModbusCli { std::move(modbusCli) }
         , lifeRatio { 0 }
         , overhaulLifeRatio { 0 }
         , surfaceTemp {}
@@ -206,19 +345,19 @@ public:
 
     void run()
     {
+        get_control_command();
+
         temp_field();
         thermal_stress();
         life();
         
-        surfaceTemp.cur = generateRandomFloat(0, 600);
+        surfaceTemp.cur = get_surface_temp(0, 600);
     }
 
     void send_message()
     {
-        const auto optional_str = m_redis->redis.hget("TS" + m_unit + ":Mechanism:Rotor" + m_name, "life");
-        double lr = std::stod(optional_str.value_or("0"));
-        const auto optional_str1 = m_redis->redis.hget("TS" + m_unit + ":Mechanism:Rotor" + m_name, "overhaulLife");
-        double olr = std::stod(optional_str1.value_or("0"));
+        double lr = m_redis->m_hget("TS" + m_unit + ":Mechanism:Rotor" + m_name, "life");
+        double olr = m_redis->m_hget("TS" + m_unit + ":Mechanism:Rotor" + m_name, "overhaulLife");
 
         json j;
         j["lifeRatio"] = lr;
@@ -235,6 +374,7 @@ public:
         j["surfaceThermalStress"] = surfaceThermalStress;
         j["thermalStress"] = thermalStress;
         j["thermalStressMargin"] = thermalStressMargin;
+
         const std::string jsonString = j.dump();
         m_MQTTCli->publish("TS" + m_unit + "/Rotor" + m_name, jsonString, QOS);
     }
@@ -243,6 +383,7 @@ private:
     const std::string m_name;
     const std::string m_unit;
     const Parameters& m_para;
+    const int m_controlWord;
 
     double tc;
     double sh;
@@ -261,9 +402,49 @@ private:
 
     std::shared_ptr<MyRedis> m_redis;
     std::shared_ptr<MyMQTT> m_MQTTCli;
+    std::unique_ptr<MyModbus> m_ModbusCli;
 
     // 输出
     std::array<double, 10> fieldmHR;
+
+    void get_control_command()
+    {
+        std::vector<uint16_t> registers;
+        try {
+            registers = m_ModbusCli.get()->read_registers(m_controlWord, 1);
+        } catch (const std::exception& e) {
+            std::cerr << "Exception: " << e.what() << std::endl;
+        }
+
+        uint16_t value = registers[0];
+        bool firstBit = value & 0x1;
+        bool secondBit = value & 0x2;
+
+        if (firstBit) {
+            m_redis->m_hset("TS" + m_unit + ":Mechanism:Rotor" + m_name, "life", "0");
+        }
+        if (secondBit) {
+            m_redis->m_hset("TS" + m_unit + ":Mechanism:Rotor" + m_name, "overhaulLife", "0");
+        }
+    }
+
+    double get_surface_temp(double min, double max)
+    {
+        std::vector<uint16_t> registers;
+        try {
+            registers = m_ModbusCli.get()->read_registers(0, 10);
+            for (size_t i { 0 }; i < registers.size(); ++i) {
+                std::cout << registers[i] << " ";
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "Exception: " << e.what() << std::endl;
+        }
+        std::cout << '\n';
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_real_distribution<> dis(min, max);
+        return dis(gen);
+    }
 
     template <typename T>
     double interpolation(double temp, const T& data, int pointNum = 8) const
@@ -353,12 +534,10 @@ private:
 
     void init()
     {
-        const auto optional_str = m_redis->redis.hget("TS" + m_unit + ":Mechanism:Rotor" + m_name, "life");
-        lifeRatio = std::stod(optional_str.value_or("0"));
-        const auto optional_str1 = m_redis->redis.hget("TS" + m_unit + ":Mechanism:Rotor" + m_name, "overhaulLife");
-        overhaulLifeRatio = std::stod(optional_str1.value_or("0"));
+        lifeRatio = m_redis->m_hget("TS" + m_unit + ":Mechanism:Rotor" + m_name, "life");
+        overhaulLifeRatio = m_redis->m_hget("TS" + m_unit + ":Mechanism:Rotor" + m_name, "overhaulLife");
 
-        double flangeTemp { generateRandomFloat(0, 600) }; // 通讯获得
+        double flangeTemp { get_surface_temp(0, 600) };
         for (std::size_t i; i < 20; ++i) {
             field[i].last = flangeTemp;
         }
@@ -413,8 +592,8 @@ private:
                 overhaulLifeRatio += lifeConsumptionRate;
                 thermalStressMax = 0;
 
-                m_redis->redis.hset("TS" + m_unit + ":Mechanism:Rotor" + m_name, "life", std::to_string(lifeRatio));
-                m_redis->redis.hset("TS" + m_unit + ":Mechanism:Rotor" + m_name, "overhaulLife", std::to_string(overhaulLifeRatio));
+                m_redis->m_hset("TS" + m_unit + ":Mechanism:Rotor" + m_name, "life", std::to_string(lifeRatio));
+                m_redis->m_hset("TS" + m_unit + ":Mechanism:Rotor" + m_name, "overhaulLife", std::to_string(overhaulLifeRatio));
             }
         }
         std::cout << lifeRatio << '\n';
@@ -423,34 +602,35 @@ private:
 
 class Task {
 private:
-    Rotor rotorHP;
-    Rotor rotorIP;
+    std::vector<Rotor> rotors;
+    const std::vector<std::string> m_names;
 
 public:
-    Task(const std::string& unit, const Parameters& para,
-        std::shared_ptr<MyRedis> redisCli, std::shared_ptr<MyMQTT> MQTTCli)
-        : rotorHP { "HP", unit, para, redisCli, MQTTCli }
-        , rotorIP { "IP", unit, para, redisCli, MQTTCli }
+    Task(const std::vector<std::string>& names, const std::string& unit, const std::vector<Parameters>& paraList, const std::vector<int>& controlWords,
+        std::shared_ptr<MyRedis> redisCli, std::shared_ptr<MyMQTT> MQTTCli, std::vector<std::unique_ptr<MyModbus>>&& modbusClis)
+        : m_names { names }
     {
+        for (size_t i { 0 }; i < names.size(); ++i) {
+            Rotor rotor(names[i], unit, paraList[i], controlWords[i], redisCli, MQTTCli, std::move(modbusClis[i]));
+            rotors.emplace_back(std::move(rotor));
+        }
     }
 
     tf::Taskflow flow(long long& count)
     {
         tf::Taskflow f("F");
 
-        tf::Task fA = f.emplace([&]() {
-                           rotorHP.run();
-                           if (count % 20 == 1) {
-                               rotorHP.send_message();
-                           }
-                       }).name("HP_Rator");
-
-        tf::Task fB = f.emplace([&]() {
-                           rotorIP.run();
-                           if (count % 20 == 1) {
-                               rotorIP.send_message();
-                           }
-                       }).name("IP_Rator");
+        const size_t len { m_names.size() };
+        std::vector<tf::Task> tasks(len);
+        for (size_t i { 0 }; i < len; ++i) {
+            // 使用&i会导致段错误
+            tasks[i] = f.emplace([this, i, &count]() {
+                            rotors[i].run();
+                            if (count % 20 == 1) {
+                                rotors[i].send_message();
+                            }
+                        }).name(m_names[i]);
+        }
         return f;
     }
 };
@@ -476,43 +656,64 @@ int main()
     const int REDIS_DB = std::atoi(std::getenv("REDIS_DB"));
     const std::string REDIS_USER { std::getenv("REDIS_USER") };
     const std::string REDIS_PASSWORD { std::getenv("REDIS_PASSWORD") };
+    const std::string REDIS_UNIX_SOCKET { std::getenv("REDIS_UNIX_SOCKET") };
+
+    const char* MODBUS_IP = std::getenv("MODBUS_IP");
+    const int MODBUS_PORT = std::atoi(std::getenv("MODBUS_PORT"));
 
     auto MQTTCli = std::make_shared<MyMQTT>(MQTT_ADDRESS, CLIENT_ID, MQTT_USERNAME, MQTT_PASSWORD,
         MQTT_CA_CERTS, MQTT_CERTFILE, MQTT_KEYFILE, MQTT_KEYFILE_PASSWORD);
-    MQTTCli->connect();
 
-    auto redisCli = std::make_shared<MyRedis>(REDIS_IP, REDIS_PORT, REDIS_DB, REDIS_USER, REDIS_PASSWORD);
+    std::shared_ptr<MyRedis> redisCli;
+    if (!REDIS_UNIX_SOCKET.empty()) {
+        redisCli = std::make_shared<MyRedis>(REDIS_UNIX_SOCKET);
+    } else {
+        redisCli = std::make_shared<MyRedis>(REDIS_IP, REDIS_PORT, REDIS_DB, REDIS_USER, REDIS_PASSWORD);
+    }
 
+    std::ifstream file("parameters.json");
+    if (!file) {
+        std::cerr << "Failed to open parameters.json\n";
+        return 1;
+    }
+
+    json j;
+    file >> j;
+
+    json paras = j["Parameters"];
+    std::vector<std::string> keys;
+    std::vector<Parameters> paraList;
+    std::vector<std::unique_ptr<MyModbus>> modbusClis;
+    std::vector<int> controlWords;
+
+    for (json::iterator it = paras.begin(); it != paras.end(); ++it) {
+        const std::string key = it.key();
+        keys.emplace_back(key);
+
+        const Parameters para = loadParameters(paras, key);
+        paraList.emplace_back(para);
+
+        int modbusID = paras[key]["modbusID"];
+        // libmodbus不支持shared_ptr
+        auto modbusCli = std::make_unique<MyModbus>(MODBUS_IP, MODBUS_PORT, modbusID);
+        modbusClis.emplace_back(std::move(modbusCli));
+
+        int controlWord = paras[key]["controlWord"];
+        controlWords.emplace_back(controlWord);
+    }
     const std::string unit1 { "1" };
-    const Parameters HP {
-        .density = 7864,
-        .radius = 1.05 / 2,
-        .holeRadius = 0,
-        .deltaR = (1.05 / 2 - 0) / 20,
-        .scanCycle = static_cast<double>(INTERVAL) / 1000,
-        .surfaceFactor = 1.55,
-        .centerFactor = 1.0,
-        .freeFactor = 510.0,
-        .tcz { .X = { 25.0, 100.0, 200.0, 300.0, 400.0, 500.0, 550.0, 600.0 }, .Y = { 37.8, 35.7, 34.5, 34.6, 35.4, 36.4, 36.8, 37.1 } },
-        .shz { .X = { 25.0, 100.0, 200.0, 300.0, 400.0, 500.0, 550.0, 600.0 }, .Y = { 436.0, 440.0, 466.0, 516.0, 591.0, 691.0, 750.0, 815.0 } },
-        .emz { .X = { 25.0, 100.0, 200.0, 300.0, 400.0, 500.0, 550.0, 600.0 }, .Y = { 211.3, 210.0, 205.0, 198.0, 188.0, 176.0, 169.0, 161.0 } },
-        .prz { .X = { 25.0, 100.0, 200.0, 300.0, 400.0, 500.0, 550.0, 600.0 }, .Y = { 0.282, 0.28, 0.28, 0.29, 0.29, 0.31, 0.32, 0.32 } },
-        .lecz { .X = { 100.0, 200.0, 300.0, 400.0, 500.0, 550.0, 600.0 }, .Y = { 11.9, 12.4, 12.8, 13.2, 13.5, 13.7, 13.9 } },
-        .SN1 { .X = { 300.0, 330.0, 350.0, 360.0, 370.0, 380.0, 390.0, 400.0, 410.0, 420.0, 430.0, 440.0, 450.0, 460.0, 470.0, 480.0, 490.0, 500.0 }, .Y = { 2.8e8, 4.33e7, 1.37e7, 7.88e6, 4.61e6, 2.73e6, 1.64e6, 1.0e6, 6.18e5, 3.85e5, 2.43e5, 1.55e5, 9.98e4, 6.49e4, 4.26e4, 2.82e4, 1.88e4, 1.27e4 } },
-        .SN2 { .X = { 300.0, 330.0, 350.0, 360.0, 370.0, 380.0, 390.0, 400.0, 410.0, 420.0, 430.0, 440.0, 450.0, 460.0, 470.0, 480.0, 490.0, 500.0 }, .Y = { 2.26e7, 3.84e6, 1.29e6, 7.63e5, 4.58e5, 2.79e5, 1.72e5, 1.08e5, 6.8e4, 4.35e4, 2.81e4, 1.83e4, 1.21e4, 8.01e3, 5.37e3, 3.63e3, 2.48e3, 1.7e3 } },
-        .SN3 { .X = { 300.0, 330.0, 350.0, 360.0, 370.0, 380.0, 390.0, 400.0, 410.0, 420.0, 430.0, 440.0, 450.0, 460.0, 470.0, 480.0, 490.0, 500.0 }, .Y = { 2.26e7, 3.84e6, 1.29e6, 7.63e5, 4.58e5, 2.79e5, 1.72e5, 1.08e5, 6.8e4, 4.35e4, 2.81e4, 1.83e4, 1.21e4, 8.01e3, 5.37e3, 3.63e3, 2.48e3, 1.7e3 } },
-        .sn { 250, 400 }
-    };
 
-    Task task1 { unit1, HP, redisCli, MQTTCli };
+    // modbusClis移出当前作用域
+    Task task1 { keys, unit1, paraList, controlWords, redisCli, MQTTCli, std::move(modbusClis) };
 
     tf::Executor executor;
     long long count { 0 };
-    
+    tf::Taskflow f { task1.flow(count) };
+
     while (1) {
         auto start = std::chrono::steady_clock::now();
 
-        executor.run(task1.flow(count)).wait();
+        executor.run(f).wait();
 
         auto end = std::chrono::steady_clock::now();
         auto elapsed_time = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
