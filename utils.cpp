@@ -13,6 +13,10 @@
 
 #include "dotenv.h"
 #include "nlohmann/json.hpp"
+#include "spdlog/async.h"
+#include <spdlog/sinks/stdout_color_sinks.h>
+#include <spdlog/sinks/rotating_file_sink.h>
+#include "spdlog/spdlog.h"
 #include "taskflow/taskflow.hpp"
 #include <modbus/modbus.h>
 #include <mqtt/async_client.h>
@@ -119,12 +123,12 @@ private:
                 throw std::runtime_error(std::string("Modbus connection failed: ") + modbus_strerror(errno));
             }
 
-            std::cout << "Connected to modbus." << std::endl;
+            spdlog::info("Connected to modbus.");
 
             modbus_set_slave(ctx.get(), m_slave_id);
             modbus_set_response_timeout(ctx.get(), 0, 200000);
         } catch (const std::exception& e) {
-            std::cerr << "Connection error: " << e.what() << std::endl;
+            spdlog::warn("Exception from modbus connect: {}", e.what());
         }
     }
 
@@ -138,7 +142,8 @@ public:
         connect();
         int socket_fd = modbus_get_socket(ctx.get());
         if (socket_fd == -1) {
-            throw std::runtime_error("Modbus connection is not established.");
+            spdlog::error("Modbus connection is not established.");
+            std::terminate();
         }
     }
 
@@ -169,7 +174,7 @@ public:
                 }
             }
         } catch (const std::exception& e) {
-            std::cerr << "Error: " << e.what() << std::endl;
+            spdlog::warn("Exception from read_registers: {}", e.what());
             holding_registers.clear();
             std::this_thread::sleep_for(std::chrono::seconds(5));
             connect(); // 断线重连
@@ -211,24 +216,24 @@ public:
         : m_redis(makeConnectionOptions(ip, port, db, user, password), makePoolOptions())
     {
         m_redis.ping();
-        std::cout << "Connected to Redis.\n";
+        spdlog::info("Connected to Redis.");
     }
 
     MyRedis(const std::string& unixSocket)
         : m_redis(unixSocket)
     {
         m_redis.ping();
-        std::cout << "Connected to Redis by unix socket.\n";
+        spdlog::info("Connected to Redis by unix socket.");
     }
 
     double m_hget(const std::string& key, const std::string& field)
     {
-        double res;
+        double res {};
         try {
             const auto optional_str = m_redis.hget(key, field);
             res = std::stod(optional_str.value_or("0"));
         } catch (const std::exception& e) {
-            std::cerr << "Exception: " << e.what() << std::endl;
+            spdlog::warn("Exception from m_hget: {}", e.what());
         }
         return res;
     }
@@ -238,7 +243,7 @@ public:
         try {
             m_redis.hset(hash, key, value);
         } catch (const std::exception& e) {
-            std::cerr << "Exception: " << e.what() << std::endl;
+            spdlog::warn("Exception from m_hset: {}", e.what());
         }
     }
 };
@@ -275,7 +280,7 @@ private:
     {
         if (client.is_connected()) {
             client.disconnect()->wait();
-            std::cout << "Disconnected from MQTT broker.\n";
+            spdlog::info("Disconnected from MQTT broker.");
         }
     }
 
@@ -289,7 +294,8 @@ public:
     {
         connect();
         if (!client.is_connected()) {
-            throw std::runtime_error("MQTT connection is not established.");
+            spdlog::error("MQTT connection is not established.");
+            std::terminate();
         }
     }
 
@@ -302,9 +308,9 @@ public:
     {
         try {
             client.connect(connOpts)->wait_for(TIMEOUT); // 断线重连
-            std::cout << "Connected to MQTT broker.\n";
+            spdlog::info("Connected to MQTT broker.");
         } catch (const mqtt::exception& e) {
-            std::cerr << "Error: " << e.what() << std::endl;
+            spdlog::warn("Exception from MQTT connect: {}", e.what());
         }
     }
 
@@ -314,10 +320,10 @@ public:
         try {
             bool ok = client.publish(msg)->wait_for(TIMEOUT);
             if (!ok) {
-                std::cerr << "Error: Publishing message timed out." << std::endl;
+                spdlog::warn("Publishing message timed out.");
             }
         } catch (const mqtt::exception& e) {
-            std::cerr << "Error: " << e.what() << std::endl;
+            spdlog::warn("Exception from publish: {}", e.what());
             connect();
         }
     }
@@ -331,14 +337,14 @@ public:
         , m_unit { unit }
         , m_para { para }
         , m_controlWord { controlWord }
-        , m_redis { redis }
-        , m_MQTTCli { MQTTCli }
-        , m_ModbusCli { std::move(modbusCli) }
         , lifeRatio { 0 }
         , overhaulLifeRatio { 0 }
         , surfaceTemp {}
         , centerTemp {}
         , field {}
+        , m_redis { redis }
+        , m_MQTTCli { MQTTCli }
+        , m_ModbusCli { std::move(modbusCli) }
     {
         init();
     }
@@ -350,7 +356,7 @@ public:
         temp_field();
         thermal_stress();
         life();
-        
+
         surfaceTemp.cur = get_surface_temp(0, 600);
     }
 
@@ -413,7 +419,7 @@ private:
         try {
             registers = m_ModbusCli.get()->read_registers(m_controlWord, 1);
         } catch (const std::exception& e) {
-            std::cerr << "Exception: " << e.what() << std::endl;
+            spdlog::warn("Exception from get_control_command: {}", e.what());
         }
 
         uint16_t value = registers[0];
@@ -433,11 +439,11 @@ private:
         std::vector<uint16_t> registers;
         try {
             registers = m_ModbusCli.get()->read_registers(0, 10);
-            for (size_t i { 0 }; i < registers.size(); ++i) {
+            for (std::size_t i { 0 }; i < registers.size(); ++i) {
                 std::cout << registers[i] << " ";
             }
         } catch (const std::exception& e) {
-            std::cerr << "Exception: " << e.what() << std::endl;
+            spdlog::warn("Exception from get_surface_temp: {}", e.what());
         }
         std::cout << '\n';
         std::random_device rd;
@@ -447,7 +453,7 @@ private:
     }
 
     template <typename T>
-    double interpolation(double temp, const T& data, int pointNum = 8) const
+    double interpolation(double temp, const T& data, std::size_t pointNum = 8) const
     {
         if (pointNum == 0 || pointNum > data.X.size()) {
             return 0.0;
@@ -458,7 +464,7 @@ private:
         } else if (temp >= data.X[pointNum - 1]) {
             return data.Y[pointNum - 1];
         } else {
-            for (size_t i = 1; i < pointNum; ++i) {
+            for (std::size_t i { 1 }; i < pointNum; ++i) {
                 if (temp < data.X[i]) {
                     double value = data.Y[i - 1] + (data.Y[i] - data.Y[i - 1]) * (temp - data.X[i - 1]) / (data.X[i] - data.X[i - 1]);
                     return value;
@@ -538,7 +544,7 @@ private:
         overhaulLifeRatio = m_redis->m_hget("TS" + m_unit + ":Mechanism:Rotor" + m_name, "overhaulLife");
 
         double flangeTemp { get_surface_temp(0, 600) };
-        for (std::size_t i; i < 20; ++i) {
+        for (std::size_t i { 0 }; i < 20; ++i) {
             field[i].last = flangeTemp;
         }
         surfaceTemp.last = flangeTemp;
@@ -610,7 +616,7 @@ public:
         std::shared_ptr<MyRedis> redisCli, std::shared_ptr<MyMQTT> MQTTCli, std::vector<std::unique_ptr<MyModbus>>&& modbusClis)
         : m_names { names }
     {
-        for (size_t i { 0 }; i < names.size(); ++i) {
+        for (std::size_t i { 0 }; i < names.size(); ++i) {
             Rotor rotor(names[i], unit, paraList[i], controlWords[i], redisCli, MQTTCli, std::move(modbusClis[i]));
             rotors.emplace_back(std::move(rotor));
         }
@@ -620,9 +626,9 @@ public:
     {
         tf::Taskflow f("F");
 
-        const size_t len { m_names.size() };
+        const std::size_t len { m_names.size() };
         std::vector<tf::Task> tasks(len);
-        for (size_t i { 0 }; i < len; ++i) {
+        for (std::size_t i { 0 }; i < len; ++i) {
             // 使用&i会导致段错误
             tasks[i] = f.emplace([this, i, &count]() {
                             rotors[i].run();
@@ -637,8 +643,22 @@ public:
 
 int main()
 {
+    auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
+    console_sink->set_level(spdlog::level::trace);
+
+    auto rotating_sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>("logs/async_log.txt", 1024 * 1024 * 10, 10, false);
+    console_sink->set_level(spdlog::level::info);
+
+    spdlog::init_thread_pool(8192, 1);
+    auto async_logger = std::make_shared<spdlog::async_logger>("async_logger", spdlog::sinks_init_list { console_sink, rotating_sink }, spdlog::thread_pool(), spdlog::async_overflow_policy::block);
+    spdlog::set_default_logger(async_logger);
+
+    spdlog::flush_every(std::chrono::seconds(3));
+    spdlog::flush_on(spdlog::level::warn);
+
     if (!fileExists(".env")) {
-        throw std::runtime_error("File .env does not exist!");
+        spdlog::error("File .env does not exist!");
+        return 1;
     }
 
     dotenv::init();
@@ -673,7 +693,7 @@ int main()
 
     std::ifstream file("parameters.json");
     if (!file) {
-        std::cerr << "Failed to open parameters.json\n";
+        spdlog::error("Failed to open parameters.json");
         return 1;
     }
 
@@ -698,7 +718,7 @@ int main()
         auto modbusCli = std::make_unique<MyModbus>(MODBUS_IP, MODBUS_PORT, modbusID);
         modbusClis.emplace_back(std::move(modbusCli));
 
-        int controlWord = paras[key]["controlWord"];
+        const int controlWord = paras[key]["controlWord"];
         controlWords.emplace_back(controlWord);
     }
     const std::string unit1 { "1" };

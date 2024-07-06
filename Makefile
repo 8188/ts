@@ -1,18 +1,21 @@
 CC = g++
-CFLAGS = -pthread -std=c++17 -I..
-LIBS = -lredis++ -lhiredis -lpaho-mqttpp3 -lmodbus
+CFLAGS = -std=c++17 -pthread -I.. -Wall -Wextra
+LDFLAGS = -L.. -lredis++ -lhiredis -lmodbus -lspdlog
 
-MQTT_LIB = $(shell ./detect_mqtt.sh)
+MQTT_LIB = -lpaho-mqttpp3 $(shell ./detect_mqtt.sh)
 
 all: utils
 
 utils: utils.cpp
-	$(CC) $(CFLAGS) $^ -o $@ $(LIBS) $(MQTT_LIB)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS) $(MQTT_LIB)
 
 debug: CFLAGS += -g
 debug: utils
 
+release: CFLAGS += -O3
+release: utils
+
 clean:
 	rm -f utils
 
-.PHONY: debug clean
+.PHONY: release debug clean
