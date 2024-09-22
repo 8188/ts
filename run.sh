@@ -1,39 +1,43 @@
 #!/bin/bash
 
-# 设置需要运行的程序和参数
-UTILS_EXEC="./utils"
-UTILS_PID=
-
-# 定义等待的秒数
+MAIN_EXEC="./main"
+MODBUS_EXEC="./modbus_server"
 RETRY_INTERVAL=10
+LOG_FILE="./process_log.txt"
 
-# 定义信号处理函数
-cleanup() {
-    echo "Stopping script..."
-    # 检查是否有正在运行的进程，如果有则杀死它
-    if [ -n "$UTILS_PID" ] && kill -0 $UTILS_PID 2>/dev/null; then
-        echo "Killing process $UTILS_PID"
-        kill -9 $UTILS_PID
+start_process() {
+    local exec_cmd=$1
+    local pid_var_name=$2
+
+    if [ -z "${!pid_var_name}" ] || ! kill -0 "${!pid_var_name}" 2>/dev/null; then
+        echo "Starting $exec_cmd ..." | tee -a $LOG_FILE
+        $exec_cmd &
+        eval "$pid_var_name=\$!"
+        echo "Started process with PID: ${!pid_var_name}" | tee -a $LOG_FILE
+    else
+        echo "Process ${!pid_var_name} is running." | tee -a $LOG_FILE
     fi
+}
+
+cleanup() {
+    echo "Stopping script..." | tee -a $LOG_FILE
+    for pid in $MAIN_PID $MODBUS_PID; do
+        if kill -0 $pid 2>/dev/null; then
+            echo "Killing process $pid" | tee -a $LOG_FILE
+            kill $pid
+            sleep 2
+            if kill -0 $pid 2>/dev/null; then
+                kill -9 $pid
+            fi
+        fi
+    done
     exit 0
 }
 
-# 注册信号处理函数
 trap cleanup SIGINT
 
-# 循环检查进程是否存在
 while true; do
-    # 检查是否已经有 pid 存在
-    if [ -n "$UTILS_PID" ] && kill -0 $UTILS_PID 2>/dev/null; then
-        echo "Process $UTILS_PID is running."
-    else
-        echo "Process is not running. Starting $UTILS_EXEC ..."
-        # 启动程序并获取其 pid
-        $UTILS_EXEC &
-        UTILS_PID=$!
-        echo "Started process with PID: $UTILS_PID"
-    fi
-
-    # 等待一段时间后重试
+    start_process "$MAIN_EXEC" MAIN_PID
+    start_process "$MODBUS_EXEC" MODBUS_PID
     sleep $RETRY_INTERVAL
 done

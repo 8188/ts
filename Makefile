@@ -1,21 +1,38 @@
-CC = g++
-CFLAGS = -std=c++17 -pthread -I.. -Wall -Wextra
-LDFLAGS = -L.. -lredis++ -lhiredis -lmodbus -lspdlog
-
+CXX = g++
+CXXFLAGS = -pthread -std=c++17 -I.. -Wall -Wextra
+LIBS = -L.. -lredis++ -lhiredis -lmodbus -lspdlog
 MQTT_LIB = -lpaho-mqttpp3 $(shell ./detect_mqtt.sh)
 
-all: utils
+OUT = main modbus_server
 
-utils: utils.cpp
-	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS) $(MQTT_LIB)
+SRC_MAIN = main.cpp $(wildcard src/*.cpp)
+OBJ_MAIN = $(SRC_MAIN:.cpp=.o)
 
-debug: CFLAGS += -g
-debug: utils
+SRC_MODBUS = modbus_server.cpp src/myLogger.cpp src/myModbus.cpp src/myRedis.cpp src/utils.cpp
+OBJ_MODBUS = $(SRC_MODBUS:.cpp=.o)
 
-release: CFLAGS += -O3
-release: utils
+DEPS = $(OBJ_MAIN:.o=.d) $(OBJ_MODBUS:.o=.d)
+
+%.o: %.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@ -MMD
+
+all: $(OUT)
+
+main: $(OBJ_MAIN)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LIBS) $(MQTT_LIB)
+
+modbus_server: $(OBJ_MODBUS)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LIBS)
+
+debug: CXXFLAGS += -g
+debug: $(OUT)
+
+release: CXXFLAGS += -O3
+release: $(OUT)
 
 clean:
-	rm -f utils
+	rm -f $(OUT) $(OBJ_MAIN) $(OBJ_MODBUS) $(DEPS)
 
-.PHONY: release debug clean
+-include $(DEPS)
+
+.PHONY: all debug release clean
