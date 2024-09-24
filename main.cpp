@@ -1,5 +1,5 @@
 #include "dotenv.h"
-#include "taskflow/taskflow.hpp"
+#include "src/myModbus.h"
 
 #include "src/myLogger.h"
 #include "src/Rotor.h"
@@ -14,31 +14,42 @@ private:
 
 public:
     Task(const std::vector<std::string>& names, const std::string& unit, const std::vector<Parameters>& paraList, const std::vector<int>& controlWords,
-        std::shared_ptr<MyRedis> redisCli, std::shared_ptr<MyMQTT> MQTTCli, std::vector<std::unique_ptr<MyModbusClient>>&& modbusClis)
+        std::shared_ptr<MyRedis> redisCli, std::shared_ptr<MyMQTT> MQTTCli,
+        std::vector<std::unique_ptr<MyModbusClient>>&& modbusClis,
+        std::shared_ptr<MyModbusServer> modbusServer)
         : m_names { names }
     {
         for (std::size_t i { 0 }; i < names.size(); ++i) {
-            Rotor rotor(names[i], unit, paraList[i], controlWords[i], redisCli, MQTTCli, std::move(modbusClis[i]));
+            Rotor rotor(names[i], unit, paraList[i], controlWords[i], redisCli, MQTTCli, std::move(modbusClis[i]), modbusServer);
             rotors.emplace_back(std::move(rotor));
         }
     }
 
-    tf::Taskflow flow(long long& count)
-    {
-        tf::Taskflow f("F");
-
+    void run(long long& count) {
         const std::size_t len { m_names.size() };
-        std::vector<tf::Task> tasks(len);
-        for (std::size_t i { 0 }; i < len; ++i) {
-            // 使用&i会导致段错误
-            tasks[i] = f.emplace([this, i, &count]() {
-                            rotors[i].run();
-                            if (count % MQTT_SEND_PERIOD == 1) {
-                                rotors[i].send_message();
-                            }
-                        }).name(m_names[i]);
+        
+        while (true) {
+            auto start = std::chrono::steady_clock::now();
+            std::vector<std::future<void>> futures;
+
+            for (std::size_t i { 0 }; i < len; ++i) {
+                futures.emplace_back(std::async(std::launch::async, [this, i, &count]() {
+                    rotors[i].run();
+                    if (count % MQTT_SEND_PERIOD == 1) {
+                        rotors[i].send_message();
+                    }
+                }));
+            }
+
+            for (auto& f : futures) {
+                f.wait();
+            }
+
+            auto end = std::chrono::steady_clock::now();
+            auto elapsed_time = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+            std::cout << "Loop " << ++count << " time used: " << elapsed_time.count() << " microseconds\n";
+            std::this_thread::sleep_for(std::chrono::microseconds(TASK_INTERVAL - elapsed_time.count()));
         }
-        return f;
     }
 };
 
@@ -68,8 +79,11 @@ int main()
     const std::string REDIS_PASSWORD { std::getenv("REDIS_PASSWORD") };
     const std::string REDIS_UNIX_SOCKET { std::getenv("REDIS_UNIX_SOCKET") };
 
-    const char* MODBUS_IP = std::getenv("MODBUS_IP");
-    const int MODBUS_PORT = std::atoi(std::getenv("MODBUS_PORT"));
+    const std::string MODBUS_CLIENT_IP = std::getenv("MODBUS_CLIENT_IP");
+    const int MODBUS_CLIENT_PORT = std::atoi(std::getenv("MODBUS_CLIENT_PORT"));
+
+    const std::string MODBUS_SERVER_IP = std::getenv("MODBUS_SERVER_IP");
+    const int MODBUS_SERVER_PORT = std::atoi(std::getenv("MODBUS_SERVER_PORT"));
 
     auto MQTTCli = std::make_shared<MyMQTT>(MQTT_ADDRESS, CLIENT_ID, MQTT_USERNAME, MQTT_PASSWORD,
         MQTT_CA_CERTS, MQTT_CERTFILE, MQTT_KEYFILE, MQTT_KEYFILE_PASSWORD);
@@ -103,32 +117,21 @@ int main()
         // std::cout << para << '\n';
         paraList.emplace_back(para);
 
-        int modbusID = std::stoi(j[key]["modbusID"].get<std::string>());
+        int slaveID = std::stoi(j[key]["slaveID"].get<std::string>());
         // libmodbus不支持shared_ptr
-        auto modbusCli = std::make_unique<MyModbusClient>(MODBUS_IP, MODBUS_PORT, modbusID);
+        auto modbusCli = std::make_unique<MyModbusClient>(MODBUS_CLIENT_IP, MODBUS_CLIENT_PORT, slaveID);
         modbusClis.emplace_back(std::move(modbusCli));
 
         const int controlWord = std::stoi(j[key]["controlWord"].get<std::string>());
         controlWords.emplace_back(controlWord);
     }
 
-    // modbusClis移出当前作用域
-    Task task1 { keys, unit1, paraList, controlWords, redisCli, MQTTCli, std::move(modbusClis) };
+    auto modbusServer = std::make_shared<MyModbusServer>(MODBUS_SERVER_IP, MODBUS_SERVER_PORT);
+    auto serverFuture = std::async(std::launch::async, [&]() { modbusServer.get()->run(); });
 
-    tf::Executor executor;
+    Task task1 { keys, unit1, paraList, controlWords, redisCli, MQTTCli, std::move(modbusClis), modbusServer };
     long long count { 0 };
-    tf::Taskflow f { task1.flow(count) };
-
-    while (1) {
-        auto start = std::chrono::steady_clock::now();
-
-        executor.run(f).wait();
-
-        auto end = std::chrono::steady_clock::now();
-        auto elapsed_time = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-        std::cout << "Loop " << ++count << " time used: " << elapsed_time.count() << " microseconds\n";
-        std::this_thread::sleep_for(std::chrono::microseconds(TASK_INTERVAL - elapsed_time.count()));
-    }
+    auto clientFuture = std::async(std::launch::async, [&]() { task1.run(count); });
 
     return 0;
 }

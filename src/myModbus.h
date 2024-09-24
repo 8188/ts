@@ -15,7 +15,7 @@ extern std::unique_ptr<modbus_mapping_t, decltype(&modbus_mapping_free)> mb_mapp
 
 class MyModbusClient {
 private:
-    const char* m_ip;
+    const std::string m_ip;
     int m_port;
     int m_slave_id;
     std::unique_ptr<modbus_t, decltype(&modbus_free)> ctx;
@@ -23,7 +23,7 @@ private:
     void connect();
 
 public:
-    MyModbusClient(const char* ip, int port, int slave_id);
+    MyModbusClient(const std::string ip, int port, int slave_id);
     MyModbusClient(const MyModbusClient&) = delete;
     MyModbusClient& operator=(const MyModbusClient&) = delete;
     MyModbusClient(MyModbusClient&&) = default;
@@ -35,12 +35,11 @@ public:
 
 class MyModbusServer {
 private:
-    const char* m_ip;
+    const std::string m_ip;
     int m_port;
-    int m_slave_id;
+    std::unique_ptr<uint8_t[]> query;
     std::unique_ptr<modbus_t, decltype(&modbus_free)> ctx;
     int listen_sock, client_sock;
-    uint8_t* query = NULL;
     unsigned int start_bits = 0;
     unsigned int start_input_bits = 0;
     unsigned int start_input_registers = 0;
@@ -54,7 +53,7 @@ private:
     void storeFloatToRegisters(uint16_t* tab_registers, std::size_t& index, float value);
 
 public:
-    MyModbusServer(const char* ip, int port, int slave_id);
+    MyModbusServer(const std::string ip, int port);
     MyModbusServer(const MyModbusServer&) = delete;
     MyModbusServer& operator=(const MyModbusServer&) = delete;
     MyModbusServer(MyModbusServer&&) = default;
@@ -62,7 +61,7 @@ public:
     ~MyModbusServer() noexcept;
 
     void run();
-    void update(json j);
+    void update(json& j, const std::string& name);
 };
 
 #endif // MYMODBUS_H

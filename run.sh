@@ -1,7 +1,6 @@
 #!/bin/bash
 
 MAIN_EXEC="./main"
-MODBUS_EXEC="./modbus_server"
 RETRY_INTERVAL=10
 LOG_FILE="./process_log.txt"
 
@@ -38,6 +37,5 @@ trap cleanup SIGINT
 
 while true; do
     start_process "$MAIN_EXEC" MAIN_PID
-    start_process "$MODBUS_EXEC" MODBUS_PID
     sleep $RETRY_INTERVAL
 done

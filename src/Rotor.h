@@ -8,13 +8,15 @@
 #include "myModbus.h"
 #include "myRedis.h"
 #include "utils.h"
+#include <memory>
 
 constexpr const int QOS { 1 };
 
 class Rotor {
 public:
     Rotor(const std::string& name, const std::string& unit, const Parameters& para, const int controlWord,
-        std::shared_ptr<MyRedis> redis, std::shared_ptr<MyMQTT> MQTTCli, std::unique_ptr<MyModbusClient> modbusCli);
+        std::shared_ptr<MyRedis> redis, std::shared_ptr<MyMQTT> MQTTCli,
+        std::unique_ptr<MyModbusClient> modbusCli, std::shared_ptr<MyModbusServer> modbusServer);
 
     void run();
     void send_message();
@@ -43,6 +45,7 @@ private:
     std::shared_ptr<MyRedis> m_redis;
     std::shared_ptr<MyMQTT> m_MQTTCli;
     std::unique_ptr<MyModbusClient> m_ModbusCli;
+    std::shared_ptr<MyModbusServer> m_ModbusServer;
 
     // 输出
     std::array<double, 10> fieldmHR;

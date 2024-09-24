@@ -1,7 +1,8 @@
 #include "Rotor.h"
 
 Rotor::Rotor(const std::string& name, const std::string& unit, const Parameters& para, const int controlWord,
-    std::shared_ptr<MyRedis> redis, std::shared_ptr<MyMQTT> MQTTCli, std::unique_ptr<MyModbusClient> modbusCli)
+    std::shared_ptr<MyRedis> redis, std::shared_ptr<MyMQTT> MQTTCli,
+    std::unique_ptr<MyModbusClient> modbusCli, std::shared_ptr<MyModbusServer> modbusServer)
     : m_name { name }
     , m_unit { unit }
     , m_para { para }
@@ -9,6 +10,7 @@ Rotor::Rotor(const std::string& name, const std::string& unit, const Parameters&
     , m_redis { redis }
     , m_MQTTCli { MQTTCli }
     , m_ModbusCli { std::move(modbusCli) }
+    , m_ModbusServer { modbusServer }
 {
     init();
 }
@@ -33,9 +35,11 @@ void Rotor::send_message()
     j["lifeRatio"] = lr;
     j["overhaulLifeRatio"] = olr;
     if (lr > 0.75) {
-        j["alert"] = "建议转子大修";
+        j["alert"] = 2; // "建议转子大修"
     } else if (olr > 0.06) {
-        j["alert"] = "建议转子报废";
+        j["alert"] = 1; // "建议转子报废"
+    } else {
+        j["alert"] = 0; // "正常"
     }
     j["ts"] = surfaceTemp.cur;
     j["temperature"] = fieldmHR;
@@ -47,7 +51,9 @@ void Rotor::send_message()
 
     const std::string jsonString = j.dump();
     m_MQTTCli->publish("TS" + m_unit + "/Rotor" + m_name, jsonString, QOS);
-    m_redis->m_hset("TS" + m_unit + ":Mechanism:SendMessage", m_name, jsonString);
+    // m_redis->m_hset("TS" + m_unit + ":Mechanism:SendMessage", m_name, jsonString);
+    // std::cout << j.dump(4) << '\n';
+    m_ModbusServer.get()->update(j, m_name);
 }
 
 void Rotor::get_control_command()
@@ -73,16 +79,17 @@ void Rotor::get_control_command()
 
 double Rotor::get_surface_temp(double min, double max)
 {
-    std::vector<uint16_t> registers;
     try {
-        registers = m_ModbusCli.get()->read_registers(0, 10);
-        for (std::size_t i { 0 }; i < registers.size(); ++i) {
-            std::cout << registers[i] << " ";
+        std::vector<uint16_t> registers = m_ModbusCli.get()->read_registers(0, 10);
+        if (!registers.empty()) {
+            for (const auto& reg : registers) {
+                std::cout << reg << " ";
+            }
         }
+        std::cout << '\n';
     } catch (const std::exception& e) {
         spdlog::warn("Exception from get_surface_temp: {}", e.what());
     }
-    std::cout << '\n';
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_real_distribution<> dis(min, max);

@@ -2,7 +2,8 @@
 !src/
 !src/**
 !main.cpp
-!modbus_server.cpp
 !Makefile
 !detect_mqtt.sh
 !run.sh
+!TSParas/
+!TSParas/**

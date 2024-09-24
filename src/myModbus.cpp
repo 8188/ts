@@ -5,36 +5,31 @@ std::unique_ptr<modbus_mapping_t, decltype(&modbus_mapping_free)> mb_mapping { n
 void MyModbusClient::connect()
 {
     try {
-        ctx.reset(modbus_new_tcp(m_ip, m_port));
+        ctx.reset(modbus_new_tcp(m_ip.c_str(), m_port));
         if (ctx == nullptr) {
             throw std::runtime_error("Failed to allocate modbus context");
         }
 
         if (modbus_connect(ctx.get()) == -1) {
-            throw std::runtime_error(std::string("Modbus connection failed: ") + modbus_strerror(errno));
+            throw std::runtime_error(std::string("Modbus client connection failed: ") + modbus_strerror(errno));
         }
 
-        spdlog::info("Connected to Modbus.");
+        spdlog::info("Modbus client {} connected.", m_slave_id);
 
         modbus_set_slave(ctx.get(), m_slave_id);
         modbus_set_response_timeout(ctx.get(), 0, 200000);
     } catch (const std::exception& e) {
-        spdlog::warn("Exception from modbus connect: {}", e.what());
+        spdlog::warn("Exception from modbus client connect {}: {}", m_slave_id, e.what());
     }
 }
 
-MyModbusClient::MyModbusClient(const char* ip, int port, int slave_id)
+MyModbusClient::MyModbusClient(const std::string ip, int port, int slave_id)
     : m_ip { ip }
     , m_port { port }
     , m_slave_id { slave_id }
     , ctx { nullptr, &modbus_free }
 {
     connect();
-    int socket_fd = modbus_get_socket(ctx.get());
-    if (socket_fd == -1) {
-        spdlog::error("Modbus connection is not established.");
-        std::terminate();
-    }
 }
 
 MyModbusClient::~MyModbusClient() noexcept
@@ -52,7 +47,7 @@ std::vector<uint16_t> MyModbusClient::read_registers(int start_registers, int nb
 
     std::vector<uint16_t> holding_registers(nb_registers);
 
-    int blocks = nb_registers / MODBUS_MAX_READ_REGISTERS + (nb_registers % MODBUS_MAX_READ_REGISTERS != 0);
+    int blocks = (nb_registers + MODBUS_MAX_READ_REGISTERS - 1) / MODBUS_MAX_READ_REGISTERS;
 
     try {
         for (int i { 0 }; i < blocks; ++i) {
@@ -75,26 +70,9 @@ std::vector<uint16_t> MyModbusClient::read_registers(int start_registers, int nb
 void MyModbusServer::init()
 {
     try {
-        ctx.reset(modbus_new_tcp(m_ip, m_port));
+        ctx.reset(modbus_new_tcp(m_ip.c_str(), m_port));
         if (ctx == nullptr) {
             throw std::runtime_error("Failed to allocate modbus context");
-        }
-
-        modbus_set_slave(ctx.get(), m_slave_id);
-
-        listen_sock = modbus_tcp_listen(ctx.get(), 1);
-        if (listen_sock == -1) {
-            spdlog::error("Unable to listen on Modbus TCP port: {}", modbus_strerror(errno));
-        }
-
-        client_sock = modbus_tcp_accept(ctx.get(), &listen_sock);
-        if (client_sock == -1) {
-            spdlog::warn("Failed to accept Modbus client: {}", modbus_strerror(errno));
-        }
-
-        query = (uint8_t*)malloc(MODBUS_TCP_MAX_ADU_LENGTH);
-        if (query == NULL) {
-            spdlog::error("Malloc Error: Out of memory!");
         }
 
         mb_mapping.reset(modbus_mapping_new_start_address(
@@ -134,18 +112,13 @@ void MyModbusServer::storeFloatToRegisters(uint16_t* tab_registers, std::size_t&
     tab_registers[index++] = (valueBits >> 16) & 0xFFFF; // High 16 bits
 }
 
-MyModbusServer::MyModbusServer(const char* ip, int port, int slave_id)
+MyModbusServer::MyModbusServer(const std::string ip, int port)
     : m_ip { ip }
     , m_port { port }
-    , m_slave_id { slave_id }
+    , query { std::make_unique<uint8_t[]>(MODBUS_TCP_MAX_ADU_LENGTH) }
     , ctx { nullptr, &modbus_free }
 {
     init();
-    int socket_fd = modbus_get_socket(ctx.get());
-    if (socket_fd == -1) {
-        spdlog::error("Modbus server connection is not established.");
-        std::terminate();
-    }
 }
 
 MyModbusServer::~MyModbusServer() noexcept
@@ -158,11 +131,22 @@ MyModbusServer::~MyModbusServer() noexcept
 void MyModbusServer::run()
 {
     int rc;
+    listen_sock = modbus_tcp_listen(ctx.get(), 5);
+    if (listen_sock == -1) {
+        spdlog::error("Unable to listen on Modbus TCP port: {}", modbus_strerror(errno));
+    }
+
+    client_sock = modbus_tcp_accept(ctx.get(), &listen_sock);
+    if (client_sock == -1) {
+        spdlog::warn("Failed to accept Modbus client: {}", modbus_strerror(errno));
+    }
+
+    spdlog::info("Modbus server is running.");
 
     while (1) {
-        rc = modbus_receive(ctx.get(), query);
+        rc = modbus_receive(ctx.get(), query.get());
         if (rc == -1) {
-            spdlog::warn("Modbus client disconnected.");
+            spdlog::warn("Modbus server receive failed.");
             client_sock = modbus_tcp_accept(ctx.get(), &listen_sock);
             if (client_sock == -1) {
                 spdlog::warn("Failed to accept Modbus client: {}", modbus_strerror(errno));
@@ -175,7 +159,7 @@ void MyModbusServer::run()
             }
             std::cout << std::dec << '\n';
 
-            rc = modbus_reply(ctx.get(), query, rc, mb_mapping.get());
+            rc = modbus_reply(ctx.get(), query.get(), rc, mb_mapping.get());
             if (rc == -1) {
                 spdlog::error("Failed to process Modbus request: {}", modbus_strerror(errno));
             }
@@ -183,27 +167,24 @@ void MyModbusServer::run()
     }
 }
 
-void MyModbusServer::update(json j)
+void MyModbusServer::update(json& j, const std::string& name)
 {
-    std::size_t index = 0;
+    std::size_t index = 37 * (std::stoi(name) - 1);
 
     try {
-        for (const auto& item : j.items()) {
-            const auto& value = item.value();
+        mb_mapping->tab_registers[index++] = j["alert"];
+        storeFloatToRegisters(mb_mapping->tab_registers, index, j["centerThermalStress"]);
+        storeFloatToRegisters(mb_mapping->tab_registers, index, j["lifeRatio"]);
+        storeFloatToRegisters(mb_mapping->tab_registers, index, j["overhaulLifeRatio"]);
+        storeFloatToRegisters(mb_mapping->tab_registers, index, j["surfaceThermalStress"]);
+        storeFloatToRegisters(mb_mapping->tab_registers, index, j["t0"]);
+        storeFloatToRegisters(mb_mapping->tab_registers, index, j["thermalStress"]);
+        storeFloatToRegisters(mb_mapping->tab_registers, index, j["thermalStressMargin"]);
+        storeFloatToRegisters(mb_mapping->tab_registers, index, j["ts"]);
 
-            storeFloatToRegisters(mb_mapping->tab_registers, index, value["centerThermalStress"]);
-            storeFloatToRegisters(mb_mapping->tab_registers, index, value["lifeRatio"]);
-            storeFloatToRegisters(mb_mapping->tab_registers, index, value["overhaulLifeRatio"]);
-            storeFloatToRegisters(mb_mapping->tab_registers, index, value["surfaceThermalStress"]);
-            storeFloatToRegisters(mb_mapping->tab_registers, index, value["t0"]);
-            storeFloatToRegisters(mb_mapping->tab_registers, index, value["thermalStress"]);
-            storeFloatToRegisters(mb_mapping->tab_registers, index, value["thermalStressMargin"]);
-            storeFloatToRegisters(mb_mapping->tab_registers, index, value["ts"]);
-
-            const auto& temperatures = value["temperature"];
-            for (const auto& temp : temperatures) {
-                storeFloatToRegisters(mb_mapping->tab_registers, index, temp);
-            }
+        const auto& temperatures = j["temperature"];
+        for (const auto& temp : temperatures) {
+            storeFloatToRegisters(mb_mapping->tab_registers, index, temp);
         }
     } catch (const std::exception& e) {
         spdlog::error("Error occurred during updating tab_registers: {}", e.what());
