@@ -13,7 +13,7 @@ ApplicationWindow {
     property bool showRowLayout: false
     property string ip: "localhost"
     property string hash: "TS1:Mechanism:RotorParams"
-    property int maxPages: 3
+    property int maxPages: 1
     property int currentPage: 1
     property var textInputObjs: ({})
     property var textInputs: ({})
@@ -278,6 +278,7 @@ ApplicationWindow {
 
     Component.onCompleted: {
         showLoginPage()
+        fetchPageNums()
     }
 
     RowLayout {
@@ -313,7 +314,7 @@ ApplicationWindow {
                 TextInput {
                     id: maxPagesInput
                     width: parent.width
-                    text: "3"
+                    text: maxPages
                     font.pixelSize: 16
 
                     onTextChanged: {
@@ -380,6 +381,8 @@ ApplicationWindow {
         }
 
         sendBatch(batch, currentPage)
+//        console.log(maxPages)
+        savePageNums(maxPages)
     }
 
     function sendBatch(batch, key) {
@@ -395,7 +398,6 @@ ApplicationWindow {
                 }
             }
         }
-
         xhr.open("GET", url)
         xhr.send()
     }
@@ -421,6 +423,40 @@ ApplicationWindow {
                         }
                     }
                 } else {
+                    console.error("Error:", xhr.statusText)
+                }
+            }
+        }
+        xhr.open("GET", url)
+        xhr.send()
+    }
+
+    function fetchPageNums() {
+        let url = `http://${ip}:7379/hget/TS1:Mechanism:RotorLife/nums`
+        let xhr = new XMLHttpRequest()
+
+        xhr.onreadystatechange = function () {
+            if (xhr.readyState === XMLHttpRequest.DONE) {
+                if (xhr.status === 200) {
+                    let data = JSON.parse(xhr.responseText).hget
+                    maxPages = data
+//                    console.log(data, maxPages)
+                } else {
+                    console.error("Error:", xhr.statusText)
+                }
+            }
+        }
+        xhr.open("GET", url)
+        xhr.send()
+    }
+
+    function savePageNums(value) {
+        let url = `http://${ip}:7379/hset/TS1:Mechanism:RotorLife/nums/${value}`
+        let xhr = new XMLHttpRequest()
+
+        xhr.onreadystatechange = function () {
+            if (xhr.readyState === XMLHttpRequest.DONE) {
+                if (xhr.status !== 200) {
                     console.error("Error:", xhr.statusText)
                 }
             }
