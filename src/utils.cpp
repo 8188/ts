@@ -49,7 +49,7 @@ std::vector<double> split_and_convert(const std::string& str)
     return result;
 }
 
-Parameters loadParameters(const json& j, const std::string& key)
+Parameters loadParasFromRedis(const json& j, const std::string& key)
 {
     auto get_value_as_double = [&j, &key](const std::string& subkey) -> double {
         auto it = j[key].find(subkey);
@@ -105,6 +105,29 @@ Parameters loadParameters(const json& j, const std::string& key)
         spdlog::error("Error loading parameters: {}", e.what());
         std::terminate();
     }
+}
+
+Parameters loadParasFromJson(const json& j, const std::string& key)
+{
+    return {
+        j[key]["density"].get<double>(),
+        j[key]["radius"].get<double>(),
+        j[key]["holeRadius"].get<double>(),
+        j[key]["deltaR"].get<double>(),
+        j[key]["scanCycle"].get<double>(),
+        j[key]["surfaceFactor"].get<double>(),
+        j[key]["centerFactor"].get<double>(),
+        j[key]["freeFactor"].get<double>(),
+        { j[key]["tcz"]["X"].get<std::vector<double>>(), j[key]["tcz"]["Y"].get<std::vector<double>>() },
+        { j[key]["shz"]["X"].get<std::vector<double>>(), j[key]["shz"]["Y"].get<std::vector<double>>() },
+        { j[key]["emz"]["X"].get<std::vector<double>>(), j[key]["emz"]["Y"].get<std::vector<double>>() },
+        { j[key]["prz"]["X"].get<std::vector<double>>(), j[key]["prz"]["Y"].get<std::vector<double>>() },
+        { j[key]["lecz"]["X"].get<std::vector<double>>(), j[key]["lecz"]["Y"].get<std::vector<double>>() },
+        { j[key]["SN1"]["X"].get<std::vector<double>>(), j[key]["SN1"]["Y"].get<std::vector<double>>() },
+        { j[key]["SN2"]["X"].get<std::vector<double>>(), j[key]["SN2"]["Y"].get<std::vector<double>>() },
+        { j[key]["SN3"]["X"].get<std::vector<double>>(), j[key]["SN3"]["Y"].get<std::vector<double>>() },
+        j[key]["sn"].get<std::array<double, 2>>()
+    };
 }
 
 bool fileExists(const std::string& filename)

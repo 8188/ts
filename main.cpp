@@ -6,6 +6,7 @@
 
 constexpr const long long TASK_INTERVAL { 5000000 };
 constexpr const int MQTT_SEND_PERIOD { 20 };
+constexpr const bool PARAS_FROM_Redis { false };
 
 class Task {
 private:
@@ -96,7 +97,17 @@ int main()
     }
 
     const std::string unit1 { "1" };
-    json j = redisCli->m_hgetall("TS" + unit1 + ":Mechanism:RotorParams");
+    json j;
+
+    if (PARAS_FROM_Redis) {
+        j = redisCli->m_hgetall("TS" + unit1 + ":Mechanism:RotorParams");
+    } else {
+        std::ifstream file("parameters.json");
+        if (!file) {
+            return 1;
+        }
+        file >> j;
+    }
     // std::cout << j.dump(4) << '\n';
     if (j.empty()) {
         spdlog::error("Empty parameters");
@@ -113,9 +124,14 @@ int main()
         // std::cout << "key: " << key << ' ';
         keys.emplace_back(key);
 
-        const Parameters para = loadParameters(j, key);
-        // std::cout << para << '\n';
-        paraList.emplace_back(para);
+        if (PARAS_FROM_Redis) {
+            Parameters paras = loadParasFromRedis(j, key);
+            paraList.emplace_back(paras);
+        } else {
+            Parameters paras = loadParasFromJson(j, key);
+            // std::cout << paras << '\n';
+            paraList.emplace_back(paras);
+        }
 
         int slaveID = std::stoi(j[key]["slaveID"].get<std::string>());
         // libmodbus不支持shared_ptr

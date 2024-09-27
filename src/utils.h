@@ -44,7 +44,9 @@ std::ostream& operator<<(std::ostream& os, const Parameters& p);
 
 std::vector<double> split_and_convert(const std::string& str);
 
-Parameters loadParameters(const json& j, const std::string& key);
+Parameters loadParasFromRedis(const json& j, const std::string& key);
+
+Parameters loadParasFromJson(const json& j, const std::string& key);
 
 bool fileExists(const std::string& filename);
 
